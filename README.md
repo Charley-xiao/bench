@@ -26,25 +26,8 @@ python bench.py --M 16 --K 4096 --Ns 4096 8192 --dtype fp16
 python plot_results.py --csv bench_results.csv
 
 ```bash
-TRITON_PRINT_AUTOTUNING=1 python bench.py \
-  --regime decode \
-  --K 8192 \
-  --Ns 4096 8192 11008 \
-  --decode_Ms 1 2 4 8 16 32 \
-  --group_size 128 \
-  --warmup_ms 25 --rep_ms 100
+TRITON_PRINT_AUTOTUNING=1 python bench.py --K 8192 --Ns 4096 8192 11008 --out bench_results.csv
 
-TRITON_PRINT_AUTOTUNING=1 python bench.py \
-  --regime prefill \
-  --K 8192 \
-  --Ns 4096 8192 11008 \
-  --prefill_Ms 128 256 512 1024 \
-  --group_size 128
-
-TRITON_PRINT_AUTOTUNING=1 python bench.py --K 8192 --Ns 4096 8192 11008
-
-TRITON_PRINT_AUTOTUNING=1 python bench.py --regime both --with_helion
-# or
-TRITON_PRINT_AUTOTUNING=1 python bench.py --regime both --with_cute
+python plot_results.py --csv bench_results.csv --outdir plots
 
 ```
