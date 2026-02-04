@@ -3,18 +3,12 @@ import torch
 import triton
 import triton.language as tl
 
-# This is the "traditional blocked data-parallel" fused kernel baseline:
-# - 2D grid over (M_tiles, N_tiles)
-# - each program computes a full C tile, accumulates over K
-# - dequant int4 weights on the fly (W4A16)
-#
-# This is the baseline the Split-K kernel is compared against in:
-# "Accelerating a Triton Fused Kernel for W4A16 Quantized Inference with SplitK work decomposition" :contentReference[oaicite:2]{index=2}
-
+# DP fused baseline (paper-style "traditional data-parallel" tiling):
+# 2D grid over (M_tiles, N_tiles), each program computes a full C tile and reduces over K.
+# This is the baseline Split-K is compared against in "SplitK vs Data Parallel" framing.
 
 @triton.autotune(
     configs=[
-        # Reasonable A100-ish starting points for a memory-bound fused kernel
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=4),
@@ -27,11 +21,11 @@ import triton.language as tl
 @triton.jit
 def _w4a16_dp_fused_kernel(
     A_ptr, Bp_ptr, S_ptr, Z_ptr, C_ptr,
-    # sizes
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    # Np = ceil(N/2) for uint8 packing (2 int4 per byte)
-    Np: tl.constexpr,
-    # strides
+    # runtime sizes
+    M, N, K,
+    # packed N dimension (ceil(N/2))
+    Np,
+    # strides (passed as constexpr for specialization)
     stride_am: tl.constexpr, stride_ak: tl.constexpr,
     stride_bpk: tl.constexpr, stride_bpn2: tl.constexpr,
     stride_sg: tl.constexpr, stride_sn: tl.constexpr,
@@ -39,7 +33,7 @@ def _w4a16_dp_fused_kernel(
     stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     # quant
     GROUP_SIZE: tl.constexpr,
-    # tile sizes
+    # tiling
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -51,41 +45,42 @@ def _w4a16_dp_fused_kernel(
     rm_in = rm < M
     rn_in = rn < N
 
-    # safe indices for pointer arithmetic (avoid OOB addresses)
+    # Optional alignment hints: apply to tensors, not constexpr ints.
+    # tl.multiple_of is a compiler hint for vectorization/alignment. :contentReference[oaicite:1]{index=1}
+    tl.multiple_of(rm, 1)
+    tl.multiple_of(rn, 1)
+
+    # Safe indices for pointer arithmetic
     rn_safe = tl.where(rn_in, rn, 0)
     n2 = rn_safe // 2
     n2_in = n2 < Np
     n2_safe = tl.where(n2_in, n2, 0)
     is_hi = (rn_safe & 1).to(tl.int1)
 
-    # Optional alignment hints (can help on some shapes)
-    tl.multiple_of(stride_ak, 1)
-    tl.multiple_of(stride_am, 1)
-    tl.multiple_of(stride_bpn2, 1)
-
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # K loop: DP tiling does full reduction inside this program
+    # DP: full K reduction inside this program
     for k0 in range(0, K, BLOCK_K):
         rk = k0 + tl.arange(0, BLOCK_K)
         rk_in = rk < K
         rk_safe = tl.where(rk_in, rk, 0)
 
-        # Load A tile [BM, BK]
+        # A tile [BM, BK]
         a_ptrs = A_ptr + rm[:, None] * stride_am + rk_safe[None, :] * stride_ak
         a = tl.load(a_ptrs, mask=rm_in[:, None] & rk_in[None, :], other=0.0).to(tl.float16)
 
-        # Load packed B bytes [BK, BN] (each byte has 2 int4)
+        # Packed weights bytes [BK, BN] (2 int4 per uint8)
         bp_ptrs = Bp_ptr + rk_safe[:, None] * stride_bpk + n2_safe[None, :] * stride_bpn2
         bp = tl.load(bp_ptrs, mask=rk_in[:, None] & rn_in[None, :] & n2_in[None, :], other=0).to(tl.uint8)
 
         lo = bp & 0x0F
         hi = (bp >> 4) & 0x0F
-        q = tl.where(is_hi[None, :], hi, lo).to(tl.int32)  # 0..15
+        q = tl.where(is_hi[None, :], hi, lo).to(tl.int32)
 
-        # Group index for scales/zeros
+        # Group index
         g = (rk_safe // GROUP_SIZE).to(tl.int32)
 
+        # scales/zeros [BK, BN]
         s_ptrs = S_ptr + g[:, None] * stride_sg + rn_safe[None, :] * stride_sn
         z_ptrs = Z_ptr + g[:, None] * stride_zg + rn_safe[None, :] * stride_zn
         sz_mask = rk_in[:, None] & rn_in[None, :]
@@ -93,13 +88,11 @@ def _w4a16_dp_fused_kernel(
         s = tl.load(s_ptrs, mask=sz_mask, other=0.0).to(tl.float16)
         z = tl.load(z_ptrs, mask=sz_mask, other=0).to(tl.uint8).to(tl.int32)
 
-        # Dequant -> FP16
-        b = (q - z).to(tl.float16) * s  # [BK, BN] fp16
+        b = (q - z).to(tl.float16) * s  # dequant -> fp16
 
-        # Accumulate
         acc += tl.dot(a, b)
 
-    # Store fp16 output
+    # Store output
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn_safe[None, :] * stride_cn
     tl.store(c_ptrs, acc.to(tl.float16), mask=rm_in[:, None] & rn_in[None, :])
 
@@ -113,8 +106,8 @@ def w4a16_triton_dp(
     group_size: int = 128,
 ) -> torch.Tensor:
     """
-    DP fused baseline (paper baseline): dequant + GEMM in one kernel,
-    using traditional blocked data-parallel tiling (no Split-K). :contentReference[oaicite:3]{index=3}
+    DP fused baseline (paper-style baseline): fused dequant + GEMM, no Split-K.
+    Autotuning uses @triton.autotune. :contentReference[oaicite:2]{index=2}
     """
     assert A.is_cuda and packed_w.is_cuda and scales.is_cuda and zeros.is_cuda
     assert A.dtype == torch.float16
@@ -124,18 +117,19 @@ def w4a16_triton_dp(
 
     M, K = A.shape
     assert K % group_size == 0
-    Np = packed_w.shape[1]  # ceil(N/2)
+
+    # packed_w is [K, ceil(N/2)]
+    Np = packed_w.shape[1]
 
     C = torch.empty((M, N), device=A.device, dtype=torch.float16)
 
-    # Meta-parameters selected by @triton.autotune based on key
-    # Grid is purely DP: 2D over output tiles
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
 
     _w4a16_dp_fused_kernel[grid](
         A, packed_w, scales, zeros, C,
-        M=M, N=N, K=K, Np=Np,
+        M, N, K,
+        Np,
         stride_am=A.stride(0), stride_ak=A.stride(1),
         stride_bpk=packed_w.stride(0), stride_bpn2=packed_w.stride(1),
         stride_sg=scales.stride(0), stride_sn=scales.stride(1),

@@ -71,7 +71,7 @@ def grid_plot_latency(df: pd.DataFrame, outpath: Path, ylog: bool = False):
     if handles:
         fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), frameon=False)
 
-    fig.suptitle("W4A16 INT4 weight-only GEMM — latency", y=0.98)
+    fig.suptitle("", y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(outpath, dpi=200)
     print(f"Saved: {outpath}")
@@ -148,7 +148,7 @@ def main():
         df,
         outdir / "speedup_vs_naive_baseline.png",
         baseline_name="baseline_dequant_matmul",
-        title="W4A16 — speedup vs naive baseline (dequant+matmul)"
+        title=""
     )
 
     # Speedup vs DP fused baseline (paper-style baseline)
@@ -156,7 +156,7 @@ def main():
         df,
         outdir / "speedup_vs_dp_fused.png",
         baseline_name="triton_dp_fused",
-        title="W4A16 — speedup vs DP fused baseline (paper baseline)"
+        title=""
     )
 
 
